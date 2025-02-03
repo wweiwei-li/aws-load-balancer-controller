@@ -2,11 +2,12 @@ package ingress
 
 import (
 	"context"
+	"strconv"
+
 	"github.com/pkg/errors"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/annotations"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/config"
 	elbv2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
-	"strconv"
 )
 
 // buildLoadBalancerMinimumCapacity builds the minimum load balancer capacity for load balancer
@@ -16,6 +17,7 @@ func (t *defaultModelBuildTask) buildLoadBalancerMinimumCapacity(_ context.Conte
 	}
 	ingGroupCapacityUnits, err := t.buildIngressGroupLoadBalancerMinimumCapacity(t.ingGroup.Members)
 	if err != nil {
+		t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build minimum load balancer capacity")
 		return nil, err
 	}
 	var minimumLoadBalancerCapacity *elbv2model.MinimumLoadBalancerCapacity

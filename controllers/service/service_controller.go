@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/go-logr/logr"
@@ -18,6 +19,7 @@ import (
 	elbv2deploy "sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/elbv2"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/tracking"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/k8s"
+	lbcmetrics "sigs.k8s.io/aws-load-balancer-controller/pkg/metrics/lbc"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/model/core"
 	elbv2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/networking"
@@ -35,11 +37,16 @@ const (
 	controllerName          = "service"
 )
 
+const (
+	DeployModelError  = "deploy model error"
+	ServiceController = "service"
+)
+
 func NewServiceReconciler(cloud services.Cloud, k8sClient client.Client, eventRecorder record.EventRecorder,
 	finalizerManager k8s.FinalizerManager, networkingSGManager networking.SecurityGroupManager,
 	networkingSGReconciler networking.SecurityGroupReconciler, subnetsResolver networking.SubnetsResolver,
 	vpcInfoProvider networking.VPCInfoProvider, elbv2TaggingManager elbv2deploy.TaggingManager, controllerConfig config.ControllerConfig,
-	backendSGProvider networking.BackendSGProvider, sgResolver networking.SecurityGroupResolver, logger logr.Logger) *serviceReconciler {
+	backendSGProvider networking.BackendSGProvider, sgResolver networking.SecurityGroupResolver, logger logr.Logger, metricsCollector lbcmetrics.MetricCollector) *serviceReconciler {
 
 	annotationParser := annotations.NewSuffixAnnotationParser(serviceAnnotationPrefix)
 	trackingProvider := tracking.NewDefaultProvider(serviceTagPrefix, controllerConfig.ClusterName)
@@ -47,7 +54,7 @@ func NewServiceReconciler(cloud services.Cloud, k8sClient client.Client, eventRe
 	modelBuilder := service.NewDefaultModelBuilder(annotationParser, subnetsResolver, vpcInfoProvider, cloud.VpcID(), trackingProvider,
 		elbv2TaggingManager, cloud.EC2(), controllerConfig.FeatureGates, controllerConfig.ClusterName, controllerConfig.DefaultTags, controllerConfig.ExternalManagedTags,
 		controllerConfig.DefaultSSLPolicy, controllerConfig.DefaultTargetType, controllerConfig.DefaultLoadBalancerScheme, controllerConfig.FeatureGates.Enabled(config.EnableIPTargetType), serviceUtils,
-		backendSGProvider, sgResolver, controllerConfig.EnableBackendSecurityGroup, controllerConfig.DisableRestrictedSGRules, logger)
+		backendSGProvider, sgResolver, controllerConfig.EnableBackendSecurityGroup, controllerConfig.DisableRestrictedSGRules, logger, metricsCollector)
 	stackMarshaller := deploy.NewDefaultStackMarshaller()
 	stackDeployer := deploy.NewDefaultStackDeployer(cloud, k8sClient, networkingSGManager, networkingSGReconciler, elbv2TaggingManager, controllerConfig, serviceTagPrefix, logger)
 	return &serviceReconciler{
@@ -65,6 +72,7 @@ func NewServiceReconciler(cloud services.Cloud, k8sClient client.Client, eventRe
 		logger:          logger,
 
 		maxConcurrentReconciles: controllerConfig.ServiceMaxConcurrentReconciles,
+		metricsCollector:        metricsCollector,
 	}
 }
 
@@ -77,10 +85,11 @@ type serviceReconciler struct {
 	serviceUtils      service.ServiceUtils
 	backendSGProvider networking.BackendSGProvider
 
-	modelBuilder    service.ModelBuilder
-	stackMarshaller deploy.StackMarshaller
-	stackDeployer   deploy.StackDeployer
-	logger          logr.Logger
+	modelBuilder     service.ModelBuilder
+	stackMarshaller  deploy.StackMarshaller
+	stackDeployer    deploy.StackDeployer
+	logger           logr.Logger
+	metricsCollector lbcmetrics.MetricCollector
 
 	maxConcurrentReconciles int
 }
@@ -109,7 +118,7 @@ func (r *serviceReconciler) reconcile(ctx context.Context, req reconcile.Request
 }
 
 func (r *serviceReconciler) buildModel(ctx context.Context, svc *corev1.Service) (core.Stack, *elbv2model.LoadBalancer, bool, error) {
-	stack, lb, backendSGRequired, err := r.modelBuilder.Build(ctx, svc)
+	stack, lb, backendSGRequired, err := r.modelBuilder.Build(ctx, svc, r.metricsCollector)
 	if err != nil {
 		r.eventRecorder.Event(svc, corev1.EventTypeWarning, k8s.ServiceEventReasonFailedBuildModel, fmt.Sprintf("Failed build model due to %v", err))
 		return nil, nil, false, err
@@ -145,15 +154,18 @@ func (r *serviceReconciler) reconcileLoadBalancerResources(ctx context.Context, 
 	}
 	err := r.deployModel(ctx, svc, stack)
 	if err != nil {
+		r.metricsCollector.ObserveControllerReconcileError(ServiceController, DeployModelError, "deploy model error")
 		return err
 	}
 	lbDNS, err := lb.DNSName().Resolve(ctx)
 	if err != nil {
+		r.metricsCollector.ObserveControllerReconcileError(ServiceController, DeployModelError, "DNS resolve error")
 		return err
 	}
 
 	if !backendSGRequired {
 		if err := r.backendSGProvider.Release(ctx, networking.ResourceTypeService, []types.NamespacedName{k8s.NamespacedName(svc)}); err != nil {
+			r.metricsCollector.ObserveControllerReconcileError(ServiceController, DeployModelError, "release auto-generated backend SG error")
 			return err
 		}
 	}

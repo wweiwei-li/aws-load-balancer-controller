@@ -17,8 +17,9 @@ limitations under the License.
 package main
 
 import (
-	"k8s.io/client-go/util/workqueue"
 	"os"
+
+	"k8s.io/client-go/util/workqueue"
 
 	elbv2deploy "sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/elbv2"
 
@@ -84,10 +85,11 @@ func main() {
 	klog.SetLoggerWithOptions(appLogger, klog.ContextualLogger(true))
 
 	var awsMetricsCollector *awsmetrics.Collector
-	lbcMetricsCollector := lbcmetrics.NewCollector(metrics.Registry)
+	var lbcMetricsCollector *lbcmetrics.Collector
 
 	if metrics.Registry != nil {
 		awsMetricsCollector = awsmetrics.NewCollector(metrics.Registry)
+		lbcMetricsCollector = lbcmetrics.NewCollector(metrics.Registry)
 	}
 
 	cloud, err := aws.NewCloud(controllerCFG.AWSConfig, controllerCFG.ClusterName, awsMetricsCollector, ctrl.Log, nil)
@@ -131,10 +133,10 @@ func main() {
 	elbv2TaggingManager := elbv2deploy.NewDefaultTaggingManager(cloud.ELBV2(), cloud.VpcID(), controllerCFG.FeatureGates, cloud.RGT(), ctrl.Log)
 	ingGroupReconciler := ingress.NewGroupReconciler(cloud, mgr.GetClient(), mgr.GetEventRecorderFor("ingress"),
 		finalizerManager, sgManager, sgReconciler, subnetResolver, elbv2TaggingManager,
-		controllerCFG, backendSGProvider, sgResolver, ctrl.Log.WithName("controllers").WithName("ingress"))
+		controllerCFG, backendSGProvider, sgResolver, ctrl.Log.WithName("controllers").WithName("ingress"), lbcMetricsCollector)
 	svcReconciler := service.NewServiceReconciler(cloud, mgr.GetClient(), mgr.GetEventRecorderFor("service"),
 		finalizerManager, sgManager, sgReconciler, subnetResolver, vpcInfoProvider, elbv2TaggingManager,
-		controllerCFG, backendSGProvider, sgResolver, ctrl.Log.WithName("controllers").WithName("service"))
+		controllerCFG, backendSGProvider, sgResolver, ctrl.Log.WithName("controllers").WithName("service"), lbcMetricsCollector)
 
 	delayingQueue := workqueue.NewDelayingQueueWithConfig(workqueue.DelayingQueueConfig{
 		Name: "delayed-target-group-binding",

@@ -5,12 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
+
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"regexp"
 	"sigs.k8s.io/aws-load-balancer-controller/apis/elbv2/v1beta1"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/algorithm"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/annotations"
@@ -41,34 +42,42 @@ func (t *defaultModelBuildTask) buildLoadBalancer(ctx context.Context, listenPor
 func (t *defaultModelBuildTask) buildLoadBalancerSpec(ctx context.Context, listenPortConfigByPort map[int32]listenPortConfig) (elbv2model.LoadBalancerSpec, error) {
 	scheme, err := t.buildLoadBalancerScheme(ctx)
 	if err != nil {
+		t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build load balancer scheme")
 		return elbv2model.LoadBalancerSpec{}, err
 	}
 	ipAddressType, err := t.buildLoadBalancerIPAddressType(ctx)
 	if err != nil {
+		t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build ip address type")
 		return elbv2model.LoadBalancerSpec{}, err
 	}
 	subnetMappings, err := t.buildLoadBalancerSubnetMappings(ctx, scheme)
 	if err != nil {
+		t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build subnet mappings")
 		return elbv2model.LoadBalancerSpec{}, err
 	}
 	securityGroups, err := t.buildLoadBalancerSecurityGroups(ctx, listenPortConfigByPort, ipAddressType)
 	if err != nil {
+		t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build security groups")
 		return elbv2model.LoadBalancerSpec{}, err
 	}
 	coIPv4Pool, err := t.buildLoadBalancerCOIPv4Pool(ctx)
 	if err != nil {
+		t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build customer owned IPv4 pool")
 		return elbv2model.LoadBalancerSpec{}, err
 	}
 	loadBalancerAttributes, err := t.buildLoadBalancerAttributes(ctx)
 	if err != nil {
+		t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build load balancer attributs")
 		return elbv2model.LoadBalancerSpec{}, err
 	}
 	tags, err := t.buildLoadBalancerTags(ctx)
 	if err != nil {
+		t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build load balancer tags")
 		return elbv2model.LoadBalancerSpec{}, err
 	}
 	name, err := t.buildLoadBalancerName(ctx, scheme)
 	if err != nil {
+		t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build load balancer name")
 		return elbv2model.LoadBalancerSpec{}, err
 	}
 	lbMinimumCapacity, err := t.buildLoadBalancerMinimumCapacity(ctx)

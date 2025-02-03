@@ -2,9 +2,10 @@ package ingress
 
 import (
 	"context"
-	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"reflect"
 	"strconv"
+
+	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/go-logr/logr"
@@ -20,6 +21,7 @@ import (
 	elbv2deploy "sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/elbv2"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/tracking"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/k8s"
+	lbcmetrics "sigs.k8s.io/aws-load-balancer-controller/pkg/metrics/lbc"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/model/core"
 	elbv2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
 	networkingpkg "sigs.k8s.io/aws-load-balancer-controller/pkg/networking"
@@ -30,10 +32,16 @@ const (
 	lbAttrsDeletionProtectionEnabled = "deletion_protection.enabled"
 )
 
+const (
+	BuildModelError   = "build model error"
+	DeployModelError  = "deploy model error"
+	IngressController = "ingress"
+)
+
 // ModelBuilder is responsible for build mode stack for a IngressGroup.
 type ModelBuilder interface {
 	// build mode stack for a IngressGroup.
-	Build(ctx context.Context, ingGroup Group) (core.Stack, *elbv2model.LoadBalancer, []types.NamespacedName, bool, error)
+	Build(ctx context.Context, ingGroup Group, metricsCollector lbcmetrics.MetricCollector) (core.Stack, *elbv2model.LoadBalancer, []types.NamespacedName, bool, error)
 }
 
 // NewDefaultModelBuilder constructs new defaultModelBuilder.
@@ -44,7 +52,7 @@ func NewDefaultModelBuilder(k8sClient client.Client, eventRecorder record.EventR
 	trackingProvider tracking.Provider, elbv2TaggingManager elbv2deploy.TaggingManager, featureGates config.FeatureGates,
 	vpcID string, clusterName string, defaultTags map[string]string, externalManagedTags []string, defaultSSLPolicy string, defaultTargetType string, defaultLoadBalancerScheme string,
 	backendSGProvider networkingpkg.BackendSGProvider, sgResolver networkingpkg.SecurityGroupResolver,
-	enableBackendSG bool, disableRestrictedSGRules bool, allowedCAARNs []string, enableIPTargetType bool, logger logr.Logger) *defaultModelBuilder {
+	enableBackendSG bool, disableRestrictedSGRules bool, allowedCAARNs []string, enableIPTargetType bool, logger logr.Logger, metricsCollector lbcmetrics.MetricCollector) *defaultModelBuilder {
 	certDiscovery := NewACMCertDiscovery(acmClient, allowedCAARNs, logger)
 	ruleOptimizer := NewDefaultRuleOptimizer(logger)
 	return &defaultModelBuilder{
@@ -74,6 +82,7 @@ func NewDefaultModelBuilder(k8sClient client.Client, eventRecorder record.EventR
 		disableRestrictedSGRules:  disableRestrictedSGRules,
 		enableIPTargetType:        enableIPTargetType,
 		logger:                    logger,
+		metricsCollector:          metricsCollector,
 	}
 }
 
@@ -109,11 +118,12 @@ type defaultModelBuilder struct {
 	disableRestrictedSGRules  bool
 	enableIPTargetType        bool
 
-	logger logr.Logger
+	logger           logr.Logger
+	metricsCollector lbcmetrics.MetricCollector
 }
 
 // build mode stack for a IngressGroup.
-func (b *defaultModelBuilder) Build(ctx context.Context, ingGroup Group) (core.Stack, *elbv2model.LoadBalancer, []types.NamespacedName, bool, error) {
+func (b *defaultModelBuilder) Build(ctx context.Context, ingGroup Group, metricsCollector lbcmetrics.MetricCollector) (core.Stack, *elbv2model.LoadBalancer, []types.NamespacedName, bool, error) {
 	stack := core.NewDefaultStack(core.StackID(ingGroup.ID))
 	task := &defaultModelBuildTask{
 		k8sClient:                b.k8sClient,
@@ -137,6 +147,7 @@ func (b *defaultModelBuilder) Build(ctx context.Context, ingGroup Group) (core.S
 		enableBackendSG:          b.enableBackendSG,
 		disableRestrictedSGRules: b.disableRestrictedSGRules,
 		enableIPTargetType:       b.enableIPTargetType,
+		metricsCollector:         b.metricsCollector,
 
 		ingGroup: ingGroup,
 		stack:    stack,
@@ -219,6 +230,8 @@ type defaultModelBuildTask struct {
 	tgByResID       map[string]*elbv2model.TargetGroup
 	backendServices map[types.NamespacedName]*corev1.Service
 	secretKeys      []types.NamespacedName
+
+	metricsCollector lbcmetrics.MetricCollector
 }
 
 func (t *defaultModelBuildTask) run(ctx context.Context) error {
@@ -270,23 +283,24 @@ func (t *defaultModelBuildTask) run(ctx context.Context) error {
 
 	t.sslRedirectConfig, err = t.buildSSLRedirectConfig(ctx, listenPortConfigByPort)
 	if err != nil {
-		return err
-	}
-	if err != nil {
+		t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build SSL Redirect Config")
 		return err
 	}
 	for port, cfg := range listenPortConfigByPort {
 		ingList := ingListByPort[port]
 		ls, err := t.buildListener(ctx, lb.LoadBalancerARN(), port, cfg, ingList)
 		if err != nil {
+			t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build listener")
 			return err
 		}
 		if err := t.buildListenerRules(ctx, ls.ListenerARN(), port, cfg.protocol, ingList); err != nil {
+			t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build listener rule")
 			return err
 		}
 	}
 
 	if err := t.buildLoadBalancerAddOns(ctx, lb.LoadBalancerARN()); err != nil {
+		t.metricsCollector.ObserveControllerReconcileError(IngressController, BuildModelError, "build load balancer addons")
 		return err
 	}
 	return nil

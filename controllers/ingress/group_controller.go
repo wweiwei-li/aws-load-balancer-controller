@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/tracking"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/ingress"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/k8s"
+	lbcmetrics "sigs.k8s.io/aws-load-balancer-controller/pkg/metrics/lbc"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/model/core"
 	elbv2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
 	networkingpkg "sigs.k8s.io/aws-load-balancer-controller/pkg/networking"
@@ -43,12 +44,17 @@ const (
 	ingressClassKind             = "IngressClass"
 )
 
+const (
+	DeployModelError  = "deploy model error"
+	IngressController = "ingress"
+)
+
 // NewGroupReconciler constructs new GroupReconciler
 func NewGroupReconciler(cloud services.Cloud, k8sClient client.Client, eventRecorder record.EventRecorder,
 	finalizerManager k8s.FinalizerManager, networkingSGManager networkingpkg.SecurityGroupManager,
 	networkingSGReconciler networkingpkg.SecurityGroupReconciler, subnetsResolver networkingpkg.SubnetsResolver,
 	elbv2TaggingManager elbv2deploy.TaggingManager, controllerConfig config.ControllerConfig, backendSGProvider networkingpkg.BackendSGProvider,
-	sgResolver networkingpkg.SecurityGroupResolver, logger logr.Logger) *groupReconciler {
+	sgResolver networkingpkg.SecurityGroupResolver, logger logr.Logger, metricsCollector lbcmetrics.MetricCollector) *groupReconciler {
 
 	annotationParser := annotations.NewSuffixAnnotationParser(annotations.AnnotationPrefixIngress)
 	authConfigBuilder := ingress.NewDefaultAuthConfigBuilder(annotationParser)
@@ -61,7 +67,7 @@ func NewGroupReconciler(cloud services.Cloud, k8sClient client.Client, eventReco
 		authConfigBuilder, enhancedBackendBuilder, trackingProvider, elbv2TaggingManager, controllerConfig.FeatureGates,
 		cloud.VpcID(), controllerConfig.ClusterName, controllerConfig.DefaultTags, controllerConfig.ExternalManagedTags,
 		controllerConfig.DefaultSSLPolicy, controllerConfig.DefaultTargetType, controllerConfig.DefaultLoadBalancerScheme, backendSGProvider, sgResolver,
-		controllerConfig.EnableBackendSecurityGroup, controllerConfig.DisableRestrictedSGRules, controllerConfig.IngressConfig.AllowedCertificateAuthorityARNs, controllerConfig.FeatureGates.Enabled(config.EnableIPTargetType), logger)
+		controllerConfig.EnableBackendSecurityGroup, controllerConfig.DisableRestrictedSGRules, controllerConfig.IngressConfig.AllowedCertificateAuthorityARNs, controllerConfig.FeatureGates.Enabled(config.EnableIPTargetType), logger, metricsCollector)
 	stackMarshaller := deploy.NewDefaultStackMarshaller()
 	stackDeployer := deploy.NewDefaultStackDeployer(cloud, k8sClient, networkingSGManager, networkingSGReconciler, elbv2TaggingManager,
 		controllerConfig, ingressTagPrefix, logger)
@@ -83,6 +89,7 @@ func NewGroupReconciler(cloud services.Cloud, k8sClient client.Client, eventReco
 		groupLoader:           groupLoader,
 		groupFinalizerManager: groupFinalizerManager,
 		logger:                logger,
+		metricsCollector:      metricsCollector,
 
 		maxConcurrentReconciles: controllerConfig.IngressConfig.MaxConcurrentReconciles,
 	}
@@ -102,6 +109,7 @@ type groupReconciler struct {
 	groupLoader           ingress.GroupLoader
 	groupFinalizerManager ingress.FinalizerManager
 	logger                logr.Logger
+	metricsCollector      lbcmetrics.MetricCollector
 
 	maxConcurrentReconciles int
 }
@@ -158,7 +166,7 @@ func (r *groupReconciler) reconcile(ctx context.Context, req reconcile.Request) 
 }
 
 func (r *groupReconciler) buildAndDeployModel(ctx context.Context, ingGroup ingress.Group) (core.Stack, *elbv2model.LoadBalancer, error) {
-	stack, lb, secrets, backendSGRequired, err := r.modelBuilder.Build(ctx, ingGroup)
+	stack, lb, secrets, backendSGRequired, err := r.modelBuilder.Build(ctx, ingGroup, r.metricsCollector)
 	if err != nil {
 		r.recordIngressGroupEvent(ctx, ingGroup, corev1.EventTypeWarning, k8s.IngressEventReasonFailedBuildModel, fmt.Sprintf("Failed build model due to %v", err))
 		return nil, nil, err
@@ -175,6 +183,7 @@ func (r *groupReconciler) buildAndDeployModel(ctx context.Context, ingGroup ingr
 		if errors.As(err, &requeueNeededAfter) {
 			return nil, nil, err
 		}
+		r.metricsCollector.ObserveControllerReconcileError(IngressController, DeployModelError, "deploy model error")
 		r.recordIngressGroupEvent(ctx, ingGroup, corev1.EventTypeWarning, k8s.IngressEventReasonFailedDeployModel, fmt.Sprintf("Failed deploy model due to %v", err))
 		return nil, nil, err
 	}
@@ -186,6 +195,7 @@ func (r *groupReconciler) buildAndDeployModel(ctx context.Context, ingGroup ingr
 		inactiveResources = append(inactiveResources, k8s.ToSliceOfNamespacedNames(ingGroup.Members)...)
 	}
 	if err := r.backendSGProvider.Release(ctx, networkingpkg.ResourceTypeIngress, inactiveResources); err != nil {
+		r.metricsCollector.ObserveControllerReconcileError(IngressController, DeployModelError, "release auto-generated backend SG error")
 		return nil, nil, err
 	}
 	return stack, lb, nil
